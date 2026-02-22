@@ -66,6 +66,10 @@ function makeSeededRng(seed: number): () => number {
   };
 }
 
+function refreshGhostPlan(state: GameState): GameState {
+  return setPipeSpawnEnabled(state, 'tee', state.pipeSpawnEnabled.tee);
+}
+
 function endpointKey(row: number, col: number): string {
   return `${row},${col}`;
 }
@@ -388,6 +392,11 @@ describe('Game state sandbox reducers', () => {
     expect(disabled.showGhostPipes).toBe(false);
   });
 
+  it('tee pipe spawning is enabled by default', () => {
+    const state = fixedState();
+    expect(state.pipeSpawnEnabled.tee).toBe(true);
+  });
+
   it('offers are sourced from ghost plan when a solvable plan exists', () => {
     const base = initGame({
       gridSize: 5,
@@ -424,6 +433,102 @@ describe('Game state sandbox reducers', () => {
           ghost.orientation === afterPlacement.offers[0]?.orientation
       )
     ).toBe(true);
+  });
+
+  it('ghost planning can produce straight, elbow, tee, and cross pipes', () => {
+    const straightBase = initGame({
+      gridWidth: 3,
+      gridHeight: 3,
+      endpointScenario: [{ size: 2, groups: 1 }],
+      energy: 20,
+      boosters: 3,
+      offerSeed: 600,
+      rng: () => 0.2
+    });
+    const straightState: GameState = {
+      ...straightBase,
+      tiles: createEmptyTiles(3, 3),
+      endpointNodes: [
+        { id: 'g1-a', row: 0, col: 1, groupId: 'g1', colorId: 0 },
+        { id: 'g1-b', row: 2, col: 1, groupId: 'g1', colorId: 0 }
+      ],
+      endpointGroups: [{ id: 'g1', colorId: 0, nodeIds: ['g1-a', 'g1-b'] }],
+      offers: [makeOffer('straight', 0)]
+    };
+    const straightPlan = refreshGhostPlan(straightState);
+    expect(straightPlan.ghostPipes.some((ghost) => ghost.kind === 'straight')).toBe(true);
+
+    const elbowBase = initGame({
+      gridWidth: 3,
+      gridHeight: 3,
+      endpointScenario: [{ size: 2, groups: 1 }],
+      energy: 20,
+      boosters: 3,
+      offerSeed: 601,
+      rng: () => 0.2
+    });
+    const elbowState: GameState = {
+      ...elbowBase,
+      tiles: createEmptyTiles(3, 3),
+      endpointNodes: [
+        { id: 'g1-a', row: 0, col: 1, groupId: 'g1', colorId: 0 },
+        { id: 'g1-b', row: 1, col: 2, groupId: 'g1', colorId: 0 }
+      ],
+      endpointGroups: [{ id: 'g1', colorId: 0, nodeIds: ['g1-a', 'g1-b'] }],
+      offers: [makeOffer('straight', 0)]
+    };
+    const elbowPlan = refreshGhostPlan(elbowState);
+    expect(elbowPlan.ghostPipes.some((ghost) => ghost.kind === 'elbow')).toBe(true);
+
+    const teeBase = initGame({
+      gridWidth: 5,
+      gridHeight: 3,
+      endpointScenario: [{ size: 3, groups: 1 }],
+      energy: 20,
+      boosters: 3,
+      offerSeed: 602,
+      rng: () => 0.2
+    });
+    const teeState: GameState = {
+      ...teeBase,
+      tiles: createEmptyTiles(3, 5),
+      endpointNodes: [
+        { id: 'g1-a', row: 0, col: 2, groupId: 'g1', colorId: 0 },
+        { id: 'g1-b', row: 2, col: 2, groupId: 'g1', colorId: 0 },
+        { id: 'g1-c', row: 1, col: 4, groupId: 'g1', colorId: 0 }
+      ],
+      endpointGroups: [{ id: 'g1', colorId: 0, nodeIds: ['g1-a', 'g1-b', 'g1-c'] }],
+      offers: [makeOffer('straight', 0)]
+    };
+    const teePlan = refreshGhostPlan(teeState);
+    expect(teePlan.ghostPipes.some((ghost) => ghost.kind === 'tee')).toBe(true);
+
+    const crossBase = initGame({
+      gridWidth: 3,
+      gridHeight: 3,
+      endpointScenario: [{ size: 2, groups: 2 }],
+      energy: 20,
+      boosters: 3,
+      offerSeed: 603,
+      rng: () => 0.2
+    });
+    const crossState: GameState = {
+      ...crossBase,
+      tiles: createEmptyTiles(3, 3),
+      endpointNodes: [
+        { id: 'g1-a', row: 1, col: 0, groupId: 'g1', colorId: 0 },
+        { id: 'g1-b', row: 1, col: 2, groupId: 'g1', colorId: 0 },
+        { id: 'g2-a', row: 0, col: 1, groupId: 'g2', colorId: 1 },
+        { id: 'g2-b', row: 2, col: 1, groupId: 'g2', colorId: 1 }
+      ],
+      endpointGroups: [
+        { id: 'g1', colorId: 0, nodeIds: ['g1-a', 'g1-b'] },
+        { id: 'g2', colorId: 1, nodeIds: ['g2-a', 'g2-b'] }
+      ],
+      offers: [makeOffer('straight', 0)]
+    };
+    const crossPlan = refreshGhostPlan(crossState);
+    expect(crossPlan.ghostPipes.some((ghost) => ghost.kind === 'cross')).toBe(true);
   });
 
   it('placement score rewards ghost-track placement and penalizes off-track placement', () => {

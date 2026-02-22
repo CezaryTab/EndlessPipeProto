@@ -1567,6 +1567,10 @@ function canMasksShareAsCross(existingMask: number, nextMask: number, crossEnabl
   return verticalPair === (Direction.N | Direction.S) && horizontalPair === (Direction.E | Direction.W);
 }
 
+function canRepresentReservationMask(mask: number, pipeSpawnEnabled: PipeSpawnEnabled): boolean {
+  return chooseGhostPipeForMask(mask, pipeSpawnEnabled) !== null;
+}
+
 function enabledKinds(pipeSpawnEnabled: PipeSpawnEnabled): PipeKind[] {
   return RANDOM_PIPE_ORDER.filter((kind) => pipeSpawnEnabled[kind]);
 }
@@ -1708,8 +1712,27 @@ function canEnterSearchCell(
   }
 
   const reservationsForCell = reservations.get(toCellKey(row, col));
-  if (reservationsForCell?.has(groupId)) {
+  if (!reservationsForCell || reservationsForCell.size === 0) {
+    return true;
+  }
+
+  const ownMask = reservationsForCell.get(groupId);
+  if (ownMask === undefined) {
+    return true;
+  }
+
+  const mergedOwnMask = ownMask | inDir;
+  if (!canRepresentReservationMask(mergedOwnMask, state.pipeSpawnEnabled)) {
     return false;
+  }
+
+  for (const [otherGroupId, otherMask] of reservationsForCell.entries()) {
+    if (otherGroupId === groupId) {
+      continue;
+    }
+    if (!canMasksShareAsCross(otherMask, mergedOwnMask, state.pipeSpawnEnabled.cross)) {
+      return false;
+    }
   }
 
   return true;
@@ -1743,8 +1766,24 @@ function canTraverseSearchTransition(
     return true;
   }
 
-  if (reservationsForCell.has(groupId)) {
-    return false;
+  const transitionMask = inDir | outDir;
+  const ownMask = reservationsForCell.get(groupId);
+  if (ownMask !== undefined) {
+    const mergedOwnMask = ownMask | transitionMask;
+    if (!canRepresentReservationMask(mergedOwnMask, state.pipeSpawnEnabled)) {
+      return false;
+    }
+
+    for (const [otherGroupId, otherMask] of reservationsForCell.entries()) {
+      if (otherGroupId === groupId) {
+        continue;
+      }
+      if (!canMasksShareAsCross(otherMask, mergedOwnMask, state.pipeSpawnEnabled.cross)) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   if (reservationsForCell.size > 1) {
@@ -1752,7 +1791,7 @@ function canTraverseSearchTransition(
   }
 
   const otherMask = reservationsForCell.values().next().value as number;
-  return canMasksShareAsCross(otherMask, inDir | outDir, state.pipeSpawnEnabled.cross);
+  return canMasksShareAsCross(otherMask, transitionMask, state.pipeSpawnEnabled.cross);
 }
 
 function entryCostForSearchCell(
@@ -1970,7 +2009,28 @@ function applyPairPathToReservations(
     const cellKey = toCellKey(transition.row, transition.col);
     const mask = transition.inDir | transition.outDir;
     const reservationsForCell = reservations.get(cellKey) ?? new Map<string, number>();
-    reservationsForCell.set(groupId, mask);
+    const existingMask = reservationsForCell.get(groupId) ?? 0;
+    const mergedMask = existingMask | mask;
+
+    if (!canRepresentReservationMask(mergedMask, state.pipeSpawnEnabled)) {
+      continue;
+    }
+
+    let crossShareValid = true;
+    for (const [otherGroupId, otherMask] of reservationsForCell.entries()) {
+      if (otherGroupId === groupId) {
+        continue;
+      }
+      if (!canMasksShareAsCross(otherMask, mergedMask, state.pipeSpawnEnabled.cross)) {
+        crossShareValid = false;
+        break;
+      }
+    }
+    if (!crossShareValid) {
+      continue;
+    }
+
+    reservationsForCell.set(groupId, mergedMask);
     reservations.set(cellKey, reservationsForCell);
   }
 }
