@@ -62,13 +62,10 @@ const BASE_PAIRS: Record<PipeKind, EdgePair[]> = {
     [Direction.N, Direction.W],
     [Direction.E, Direction.W]
   ],
+  // Overpass: two independent channels.
   cross: [
-    [Direction.N, Direction.E],
     [Direction.N, Direction.S],
-    [Direction.N, Direction.W],
-    [Direction.E, Direction.S],
-    [Direction.E, Direction.W],
-    [Direction.S, Direction.W]
+    [Direction.E, Direction.W]
   ],
   doubleElbow: [
     [Direction.N, Direction.E],

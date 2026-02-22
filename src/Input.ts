@@ -9,7 +9,8 @@ export interface GridMetrics {
   originX: number;
   originY: number;
   cellSize: number;
-  gridSize: number;
+  gridWidth: number;
+  gridHeight: number;
 }
 
 export interface DragCallbacks {
@@ -38,7 +39,7 @@ function pointToCell(point: PointerPoint, metrics: GridMetrics): Cell | null {
   const col = Math.floor(localX / metrics.cellSize);
   const row = Math.floor(localY / metrics.cellSize);
 
-  if (row < 0 || row >= metrics.gridSize || col < 0 || col >= metrics.gridSize) {
+  if (row < 0 || row >= metrics.gridHeight || col < 0 || col >= metrics.gridWidth) {
     return null;
   }
 

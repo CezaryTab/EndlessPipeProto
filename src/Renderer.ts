@@ -1,19 +1,24 @@
-import { getCellAnimationState, type AnimationState } from './Animation';
 import { ENDPOINT_COLOR_PALETTE, type GameState } from './GameState';
 import {
   ALL_DIRECTIONS,
+  Direction,
+  areEdgesConnected,
   directionToDelta,
   getPipeTopology,
+  isDirectionOpen,
+  oppositeDirection,
+  type DirectionBit,
   type Orientation,
   type PipeKind
 } from './Pipe';
-import type { Cell, RouteId } from './RouteSolver';
+import type { Cell } from './RouteSolver';
 
 export interface GridRenderMetrics {
   originX: number;
   originY: number;
   cellSize: number;
-  gridSize: number;
+  gridWidth: number;
+  gridHeight: number;
 }
 
 export interface DragRenderState {
@@ -28,8 +33,8 @@ export interface DragRenderState {
 
 export interface RenderFrameModel {
   game: GameState;
-  animation: AnimationState;
   drag: DragRenderState;
+  hiddenEndpointIds?: Set<string>;
   width: number;
   height: number;
 }
@@ -39,55 +44,272 @@ interface CellCenter {
   y: number;
 }
 
-export const ROUTE_PREVIEW_STYLE_BY_ID: Record<RouteId, {
-  dash: number[];
-  alpha: number;
-  width: number;
-  color: string;
-}> = {
-  easy: { dash: [1, 12], alpha: 0.56, width: 2.9, color: '#4fdf7f' },
-  medium: { dash: [1, 8], alpha: 0.54, width: 2.7, color: '#f4d24d' },
-  hard: { dash: [1, 5], alpha: 0.52, width: 2.5, color: '#ff6464' }
-};
-
-function parseHexColor(hex: string): { r: number; g: number; b: number } {
-  const normalized = hex.replace('#', '');
-  const value = normalized.length === 3
-    ? normalized
-        .split('')
-        .map((part) => `${part}${part}`)
-        .join('')
-    : normalized;
-
-  return {
-    r: parseInt(value.slice(0, 2), 16),
-    g: parseInt(value.slice(2, 4), 16),
-    b: parseInt(value.slice(4, 6), 16)
-  };
+interface TraverseState {
+  row: number;
+  col: number;
+  inDir: DirectionBit;
 }
 
-function mixHexColors(from: string, to: string, t: number): string {
-  const ratio = Math.max(0, Math.min(1, t));
-  const a = parseHexColor(from);
-  const b = parseHexColor(to);
-
-  const r = Math.round(a.r + (b.r - a.r) * ratio);
-  const g = Math.round(a.g + (b.g - a.g) * ratio);
-  const bValue = Math.round(a.b + (b.b - a.b) * ratio);
-
-  return `rgb(${r}, ${g}, ${bValue})`;
+interface CrossChannelColors {
+  vertical: string | null;
+  horizontal: string | null;
 }
 
-function computeGridMetrics(width: number, height: number, gridSize: number): GridRenderMetrics {
+function toCellKey(row: number, col: number): string {
+  return `${row},${col}`;
+}
+
+function isInsideGrid(gridHeight: number, gridWidth: number, row: number, col: number): boolean {
+  return row >= 0 && row < gridHeight && col >= 0 && col < gridWidth;
+}
+
+export function resolveConnectedPipeColors(game: GameState): Map<string, string> {
+  const colorIdsByCell = new Map<string, Set<number>>();
+
+  for (const endpoint of game.endpointNodes) {
+    const queue: TraverseState[] = [];
+    const visitedStates = new Set<string>();
+
+    for (const direction of ALL_DIRECTIONS) {
+      const delta = directionToDelta(direction);
+      const neighborRow = endpoint.row + delta.dr;
+      const neighborCol = endpoint.col + delta.dc;
+      if (!isInsideGrid(game.gridHeight, game.gridWidth, neighborRow, neighborCol)) {
+        continue;
+      }
+
+      const neighborTile = game.tiles[neighborRow]?.[neighborCol];
+      if (!neighborTile) {
+        continue;
+      }
+
+      const incoming = oppositeDirection(direction);
+      if (!isDirectionOpen(neighborTile.kind, neighborTile.orientation, incoming)) {
+        continue;
+      }
+
+      queue.push({
+        row: neighborRow,
+        col: neighborCol,
+        inDir: incoming
+      });
+    }
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      const stateKey = `${current.row},${current.col},${current.inDir}`;
+      if (visitedStates.has(stateKey)) {
+        continue;
+      }
+      visitedStates.add(stateKey);
+
+      const tile = game.tiles[current.row]?.[current.col];
+      if (!tile) {
+        continue;
+      }
+
+      if (!isDirectionOpen(tile.kind, tile.orientation, current.inDir)) {
+        continue;
+      }
+
+      const cellKey = toCellKey(current.row, current.col);
+      const seenColors = colorIdsByCell.get(cellKey) ?? new Set<number>();
+      seenColors.add(endpoint.colorId);
+      colorIdsByCell.set(cellKey, seenColors);
+
+      for (const outDirection of ALL_DIRECTIONS) {
+        if (outDirection === current.inDir) {
+          continue;
+        }
+
+        if (
+          !isDirectionOpen(tile.kind, tile.orientation, outDirection) ||
+          !areEdgesConnected(tile.kind, tile.orientation, current.inDir, outDirection)
+        ) {
+          continue;
+        }
+
+        const delta = directionToDelta(outDirection);
+        const nextRow = current.row + delta.dr;
+        const nextCol = current.col + delta.dc;
+        if (!isInsideGrid(game.gridHeight, game.gridWidth, nextRow, nextCol)) {
+          continue;
+        }
+
+        const nextTile = game.tiles[nextRow]?.[nextCol];
+        if (!nextTile) {
+          continue;
+        }
+
+        const nextIncoming = oppositeDirection(outDirection);
+        if (!isDirectionOpen(nextTile.kind, nextTile.orientation, nextIncoming)) {
+          continue;
+        }
+
+        queue.push({
+          row: nextRow,
+          col: nextCol,
+          inDir: nextIncoming
+        });
+      }
+    }
+  }
+
+  const colorByCell = new Map<string, string>();
+  for (const [cellKey, colorIds] of colorIdsByCell.entries()) {
+    if (colorIds.size !== 1) {
+      continue;
+    }
+
+    const colorId = colorIds.values().next().value as number;
+    colorByCell.set(
+      cellKey,
+      ENDPOINT_COLOR_PALETTE[colorId % ENDPOINT_COLOR_PALETTE.length] ?? '#f4f7ff'
+    );
+  }
+
+  return colorByCell;
+}
+
+function resolveSingleColor(colorIds: Set<number>): string | null {
+  if (colorIds.size !== 1) {
+    return null;
+  }
+  const colorId = colorIds.values().next().value as number;
+  return ENDPOINT_COLOR_PALETTE[colorId % ENDPOINT_COLOR_PALETTE.length] ?? '#f4f7ff';
+}
+
+export function resolveConnectedCrossChannelColors(game: GameState): Map<string, CrossChannelColors> {
+  const channelColorIdsByCell = new Map<string, { vertical: Set<number>; horizontal: Set<number> }>();
+
+  for (const endpoint of game.endpointNodes) {
+    const queue: TraverseState[] = [];
+    const visitedStates = new Set<string>();
+
+    for (const direction of ALL_DIRECTIONS) {
+      const delta = directionToDelta(direction);
+      const neighborRow = endpoint.row + delta.dr;
+      const neighborCol = endpoint.col + delta.dc;
+      if (!isInsideGrid(game.gridHeight, game.gridWidth, neighborRow, neighborCol)) {
+        continue;
+      }
+
+      const neighborTile = game.tiles[neighborRow]?.[neighborCol];
+      if (!neighborTile) {
+        continue;
+      }
+
+      const incoming = oppositeDirection(direction);
+      if (!isDirectionOpen(neighborTile.kind, neighborTile.orientation, incoming)) {
+        continue;
+      }
+
+      queue.push({
+        row: neighborRow,
+        col: neighborCol,
+        inDir: incoming
+      });
+    }
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      const stateKey = `${current.row},${current.col},${current.inDir}`;
+      if (visitedStates.has(stateKey)) {
+        continue;
+      }
+      visitedStates.add(stateKey);
+
+      const tile = game.tiles[current.row]?.[current.col];
+      if (!tile) {
+        continue;
+      }
+
+      if (!isDirectionOpen(tile.kind, tile.orientation, current.inDir)) {
+        continue;
+      }
+
+      if (tile.kind === 'cross') {
+        const key = toCellKey(current.row, current.col);
+        const channelSets = channelColorIdsByCell.get(key) ?? {
+          vertical: new Set<number>(),
+          horizontal: new Set<number>()
+        };
+
+        if (current.inDir === Direction.N || current.inDir === Direction.S) {
+          channelSets.vertical.add(endpoint.colorId);
+        } else if (current.inDir === Direction.E || current.inDir === Direction.W) {
+          channelSets.horizontal.add(endpoint.colorId);
+        }
+        channelColorIdsByCell.set(key, channelSets);
+      }
+
+      for (const outDirection of ALL_DIRECTIONS) {
+        if (outDirection === current.inDir) {
+          continue;
+        }
+
+        if (
+          !isDirectionOpen(tile.kind, tile.orientation, outDirection) ||
+          !areEdgesConnected(tile.kind, tile.orientation, current.inDir, outDirection)
+        ) {
+          continue;
+        }
+
+        const delta = directionToDelta(outDirection);
+        const nextRow = current.row + delta.dr;
+        const nextCol = current.col + delta.dc;
+        if (!isInsideGrid(game.gridHeight, game.gridWidth, nextRow, nextCol)) {
+          continue;
+        }
+
+        const nextTile = game.tiles[nextRow]?.[nextCol];
+        if (!nextTile) {
+          continue;
+        }
+
+        const nextIncoming = oppositeDirection(outDirection);
+        if (!isDirectionOpen(nextTile.kind, nextTile.orientation, nextIncoming)) {
+          continue;
+        }
+
+        queue.push({
+          row: nextRow,
+          col: nextCol,
+          inDir: nextIncoming
+        });
+      }
+    }
+  }
+
+  const result = new Map<string, CrossChannelColors>();
+  for (const [key, channels] of channelColorIdsByCell.entries()) {
+    result.set(key, {
+      vertical: resolveSingleColor(channels.vertical),
+      horizontal: resolveSingleColor(channels.horizontal)
+    });
+  }
+  return result;
+}
+
+function computeGridMetrics(
+  width: number,
+  height: number,
+  gridWidth: number,
+  gridHeight: number
+): GridRenderMetrics {
   const padding = 22;
-  const boardPixels = Math.max(120, Math.min(width - padding * 2, height - padding * 2));
-  const cellSize = boardPixels / gridSize;
+  const availableWidth = Math.max(120, width - padding * 2);
+  const availableHeight = Math.max(120, height - padding * 2);
+  const cellSize = Math.max(8, Math.min(availableWidth / gridWidth, availableHeight / gridHeight));
+  const boardPixelWidth = cellSize * gridWidth;
+  const boardPixelHeight = cellSize * gridHeight;
 
   return {
-    originX: (width - boardPixels) / 2,
-    originY: (height - boardPixels) / 2,
+    originX: (width - boardPixelWidth) / 2,
+    originY: (height - boardPixelHeight) / 2,
     cellSize,
-    gridSize
+    gridWidth,
+    gridHeight
   };
 }
 
@@ -115,24 +337,25 @@ function drawGrid(
   ctx: CanvasRenderingContext2D,
   metrics: GridRenderMetrics
 ): void {
-  const boardPixels = metrics.cellSize * metrics.gridSize;
+  const boardWidth = metrics.cellSize * metrics.gridWidth;
+  const boardHeight = metrics.cellSize * metrics.gridHeight;
 
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
   ctx.lineWidth = 1;
 
-  for (let i = 0; i <= metrics.gridSize; i += 1) {
+  for (let i = 0; i <= metrics.gridWidth; i += 1) {
     const offset = metrics.originX + i * metrics.cellSize;
     ctx.beginPath();
     ctx.moveTo(offset, metrics.originY);
-    ctx.lineTo(offset, metrics.originY + boardPixels);
+    ctx.lineTo(offset, metrics.originY + boardHeight);
     ctx.stroke();
   }
 
-  for (let i = 0; i <= metrics.gridSize; i += 1) {
+  for (let i = 0; i <= metrics.gridHeight; i += 1) {
     const offset = metrics.originY + i * metrics.cellSize;
     ctx.beginPath();
     ctx.moveTo(metrics.originX, offset);
-    ctx.lineTo(metrics.originX + boardPixels, offset);
+    ctx.lineTo(metrics.originX + boardWidth, offset);
     ctx.stroke();
   }
 }
@@ -141,16 +364,17 @@ function drawEndpoints(
   ctx: CanvasRenderingContext2D,
   game: GameState,
   metrics: GridRenderMetrics,
-  animation: AnimationState
+  hiddenEndpointIds?: Set<string>
 ): void {
   const radius = metrics.cellSize * 0.16;
 
   for (const endpoint of game.endpointNodes) {
+    if (hiddenEndpointIds?.has(endpoint.id)) {
+      continue;
+    }
+
     const center = cellCenter({ row: endpoint.row, col: endpoint.col }, metrics);
-    const groupColor = ENDPOINT_COLOR_PALETTE[endpoint.colorId % ENDPOINT_COLOR_PALETTE.length] ?? '#ffffff';
-    const color = animation.phase === 'idle'
-      ? groupColor
-      : mixHexColors(groupColor, animation.color, 0.4);
+    const color = ENDPOINT_COLOR_PALETTE[endpoint.colorId % ENDPOINT_COLOR_PALETTE.length] ?? '#ffffff';
 
     ctx.save();
     ctx.fillStyle = color;
@@ -207,6 +431,19 @@ function drawPipeSymbol(
     return;
   }
 
+  if (kind === 'cross') {
+    const gapRadius = cellSize * 0.18;
+    for (const direction of ALL_DIRECTIONS) {
+      const delta = directionToDelta(direction);
+      ctx.beginPath();
+      ctx.moveTo(delta.dc * gapRadius, delta.dr * gapRadius);
+      ctx.lineTo(delta.dc * armLength, delta.dr * armLength);
+      ctx.stroke();
+    }
+    ctx.restore();
+    return;
+  }
+
   for (const direction of ALL_DIRECTIONS) {
     if ((topology.mask & direction) === 0) {
       continue;
@@ -226,34 +463,79 @@ function drawPipeSymbol(
   ctx.restore();
 }
 
+function drawCrossSymbol(
+  ctx: CanvasRenderingContext2D,
+  center: CellCenter,
+  cellSize: number,
+  verticalColor: string,
+  horizontalColor: string,
+  alpha: number,
+  scale: number
+): void {
+  const armLength = cellSize * 0.38;
+  const lineWidth = cellSize * 0.21;
+  const horizontalGapRadius = cellSize * 0.24;
+
+  ctx.save();
+  ctx.translate(center.x, center.y);
+  ctx.scale(scale, scale);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = lineWidth;
+  ctx.globalAlpha = alpha;
+
+  ctx.strokeStyle = verticalColor;
+  ctx.beginPath();
+  ctx.moveTo(0, -armLength);
+  ctx.lineTo(0, armLength);
+  ctx.stroke();
+
+  ctx.strokeStyle = horizontalColor;
+  ctx.beginPath();
+  ctx.moveTo(-horizontalGapRadius, 0);
+  ctx.lineTo(-armLength, 0);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(horizontalGapRadius, 0);
+  ctx.lineTo(armLength, 0);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
 function drawPlacedPipes(
   ctx: CanvasRenderingContext2D,
   game: GameState,
-  metrics: GridRenderMetrics,
-  animation: AnimationState
+  metrics: GridRenderMetrics
 ): void {
-  for (let row = 0; row < game.gridSize; row += 1) {
-    for (let col = 0; col < game.gridSize; col += 1) {
+  const connectedColors = resolveConnectedPipeColors(game);
+  const connectedCrossChannels = resolveConnectedCrossChannelColors(game);
+
+  for (let row = 0; row < game.gridHeight; row += 1) {
+    for (let col = 0; col < game.gridWidth; col += 1) {
       const tile = game.tiles[row][col];
       if (!tile) {
         continue;
       }
 
-      const animationState = getCellAnimationState(animation, row, col);
-      const groupColor = tile.groupId
-        ? ENDPOINT_COLOR_PALETTE[
-            (game.endpointGroups.find((group) => group.id === tile.groupId)?.colorId ?? 0) %
-              ENDPOINT_COLOR_PALETTE.length
-          ]
-        : '#ffffff';
-      const fillProgress = animationState.flowProgress;
-      const flowingColor = fillProgress <= 0
-        ? '#ffffff'
-        : mixHexColors('#ffffff', groupColor, fillProgress);
-      const color = flowingColor;
-      const alpha = 1 - animationState.burstProgress;
-      const scale = 1 - 0.35 * animationState.burstProgress;
       const center = cellCenter({ row, col }, metrics);
+      const cellKey = toCellKey(row, col);
+      const neutralColor = '#f4f7ff';
+
+      if (tile.kind === 'cross') {
+        const channels = connectedCrossChannels.get(cellKey);
+        drawCrossSymbol(
+          ctx,
+          center,
+          metrics.cellSize,
+          channels?.vertical ?? neutralColor,
+          channels?.horizontal ?? neutralColor,
+          1,
+          1
+        );
+        continue;
+      }
 
       drawPipeSymbol(
         ctx,
@@ -261,56 +543,58 @@ function drawPlacedPipes(
         metrics.cellSize,
         tile.kind,
         tile.orientation,
-        color,
-        alpha,
-        scale
+        connectedColors.get(cellKey) ?? neutralColor,
+        1,
+        1
       );
     }
   }
 }
 
-function drawRoutes(
+function drawGhostPipes(
   ctx: CanvasRenderingContext2D,
   game: GameState,
   metrics: GridRenderMetrics
 ): void {
-  if (!game.showRoutePreviews) {
+  if (!game.showGhostPipes || game.ghostPipes.length === 0) {
     return;
   }
 
-  const nodeById = new Map(game.endpointNodes.map((node) => [node.id, node]));
+  const ghostColor = '#f4f7ff';
+  const ghostAlpha = 0.1;
 
-  for (const route of game.routes) {
-    if (route.cells.length === 0) {
+  for (const ghost of game.ghostPipes) {
+    if (!isInsideGrid(game.gridHeight, game.gridWidth, ghost.row, ghost.col)) {
+      continue;
+    }
+    if (game.tiles[ghost.row][ghost.col] !== null) {
       continue;
     }
 
-    const fromNode = nodeById.get(route.fromNodeId);
-    const toNode = nodeById.get(route.toNodeId);
-    if (!fromNode || !toNode) {
+    const center = cellCenter({ row: ghost.row, col: ghost.col }, metrics);
+    if (ghost.kind === 'cross') {
+      drawCrossSymbol(
+        ctx,
+        center,
+        metrics.cellSize,
+        ghostColor,
+        ghostColor,
+        ghostAlpha,
+        1
+      );
       continue;
     }
 
-    const style = ROUTE_PREVIEW_STYLE_BY_ID[route.id];
-    const points: CellCenter[] = [
-      cellCenter({ row: fromNode.row, col: fromNode.col }, metrics),
-      ...route.cells.map((cell) => cellCenter(cell, metrics)),
-      cellCenter({ row: toNode.row, col: toNode.col }, metrics)
-    ];
-
-    ctx.save();
-    ctx.globalAlpha = style.alpha;
-    ctx.strokeStyle = style.color;
-    ctx.lineWidth = style.width;
-    ctx.lineCap = 'round';
-    ctx.setLineDash(style.dash);
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    for (let index = 1; index < points.length; index += 1) {
-      ctx.lineTo(points[index].x, points[index].y);
-    }
-    ctx.stroke();
-    ctx.restore();
+    drawPipeSymbol(
+      ctx,
+      center,
+      metrics.cellSize,
+      ghost.kind,
+      ghost.orientation,
+      ghostColor,
+      ghostAlpha,
+      1
+    );
   }
 }
 
@@ -364,15 +648,20 @@ export function renderFrame(
   ctx: CanvasRenderingContext2D,
   model: RenderFrameModel
 ): GridRenderMetrics {
-  const metrics = computeGridMetrics(model.width, model.height, model.game.gridSize);
+  const metrics = computeGridMetrics(
+    model.width,
+    model.height,
+    model.game.gridWidth,
+    model.game.gridHeight
+  );
 
   drawBackground(ctx, model.width, model.height);
-  drawRoutes(ctx, model.game, metrics);
   drawGrid(ctx, metrics);
+  drawGhostPipes(ctx, model.game, metrics);
   drawHoverState(ctx, model.drag, metrics);
   drawInvalidPlacement(ctx, model.game, metrics);
-  drawPlacedPipes(ctx, model.game, metrics, model.animation);
-  drawEndpoints(ctx, model.game, metrics, model.animation);
+  drawPlacedPipes(ctx, model.game, metrics);
+  drawEndpoints(ctx, model.game, metrics, model.hiddenEndpointIds);
 
   return metrics;
 }
