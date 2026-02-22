@@ -188,6 +188,7 @@ export interface GameState {
   offers: OfferSpec[];
   ghostPipes: GhostPipe[];
   showGhostPipes: boolean;
+  ghostRecoveryRequired: boolean;
   score: number;
   maxScoreReached: number;
   difficultyTiers: DifficultyTier[];
@@ -690,6 +691,18 @@ function applyScoreDelta(
 
 function cloneTiles(tiles: TileGrid): TileGrid {
   return tiles.map((row) => row.slice());
+}
+
+function countPlacedPipes(tiles: TileGrid): number {
+  let count = 0;
+  for (const row of tiles) {
+    for (const tile of row) {
+      if (tile !== null) {
+        count += 1;
+      }
+    }
+  }
+  return count;
 }
 
 function toCellKey(row: number, col: number): string {
@@ -2288,10 +2301,13 @@ function withResolvedPlanOffer(
 ): GameState {
   const ghostPipes = computeGhostPlan(state);
   const { offer, source } = chooseOfferFromGhostPlan(state, ghostPipes, options);
+  const placedPipeCount = countPlacedPipes(state.tiles);
+  const ghostRecoveryRequired = ghostPipes.length === 0 && placedPipeCount > 0;
   let next = {
     ...state,
     ghostPipes,
-    offers: [offer]
+    offers: [offer],
+    ghostRecoveryRequired
   };
 
   next = appendGameLog(
@@ -2306,6 +2322,17 @@ function withResolvedPlanOffer(
       ghostCount: ghostPipes.length
     }
   );
+
+  if (ghostRecoveryRequired && !state.ghostRecoveryRequired) {
+    next = appendGameLog(
+      next,
+      'ghost.recovery.required',
+      'Ghost solver found no route. Recovery clear is available.',
+      {
+        placedPipeCount
+      }
+    );
+  }
 
   return next;
 }
@@ -2950,6 +2977,7 @@ export function initGame(options: InitGameOptions = {}): GameState {
     offers: [],
     ghostPipes: [],
     showGhostPipes: false,
+    ghostRecoveryRequired: false,
     score,
     maxScoreReached,
     difficultyTiers,
@@ -3268,6 +3296,62 @@ export function setShowGhostPipes(state: GameState, enabled: boolean): GameState
     ...state,
     showGhostPipes: enabled
   };
+}
+
+export function dismissGhostRecovery(state: GameState): GameState {
+  if (!state.ghostRecoveryRequired) {
+    return state;
+  }
+
+  return appendGameLog(
+    {
+      ...state,
+      ghostRecoveryRequired: false
+    },
+    'ghost.recovery.dismissed',
+    'Ghost recovery popup dismissed.'
+  );
+}
+
+export function clearAllPipesForGhostRecovery(state: GameState): GameState {
+  const clearedCount = countPlacedPipes(state.tiles);
+  const nextTiles = createEmptyTiles(state.gridHeight, state.gridWidth);
+  const energyBefore = state.energy;
+  const energyAfter = Math.max(0, energyBefore - 20);
+
+  let next: GameState = {
+    ...state,
+    tiles: nextTiles,
+    energy: energyAfter,
+    offerSeed: state.offerSeed + 1,
+    hoveredCell: null,
+    invalidCell: null,
+    ghostRecoveryRequired: false
+  };
+
+  next = applyScoreDelta(
+    next,
+    -100,
+    'Ghost recovery clear penalty',
+    {
+      penaltyEnergy: -20,
+      penaltyScore: -100,
+      clearedPipeCount: clearedCount
+    }
+  );
+
+  next = appendGameLog(
+    next,
+    'ghost.recovery.clear',
+    `Cleared ${clearedCount} placed pipe${clearedCount === 1 ? '' : 's'} for ghost recovery.`,
+    {
+      clearedPipeCount: clearedCount,
+      energyBefore,
+      energyAfter
+    }
+  );
+
+  return withResolvedPlanOffer(next, 'Offer after ghost recovery clear');
 }
 
 export function resetScore(state: GameState): GameState {

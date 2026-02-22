@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   addGridHeight,
   addGridWidth,
+  clearAllPipesForGhostRecovery,
   createEmptyTiles,
   discardAllOffers,
   getUnlockedDifficultyTier,
@@ -606,6 +607,69 @@ describe('Game state sandbox reducers', () => {
     expect(state.ghostPipes).toHaveLength(0);
     expect(state.offers[0]?.id).not.toContain('-ghost-');
     expect(state.offers[0]?.kind).toBe('straight');
+  });
+
+  it('flags ghost recovery when no ghost solution exists on a blocked board', () => {
+    const base = initGame({
+      gridWidth: 3,
+      gridHeight: 1,
+      endpointScenario: [{ size: 2, groups: 1 }],
+      energy: 20,
+      boosters: 3,
+      offerSeed: 460,
+      rng: () => 0.2
+    });
+
+    const state: GameState = {
+      ...base,
+      tiles: createEmptyTiles(1, 3),
+      endpointNodes: [
+        { id: 'g1-a', row: 0, col: 0, groupId: 'g1', colorId: 0 },
+        { id: 'g1-b', row: 0, col: 2, groupId: 'g1', colorId: 0 }
+      ],
+      endpointGroups: [{ id: 'g1', colorId: 0, nodeIds: ['g1-a', 'g1-b'] }],
+      offers: [makeOffer('straight', 90)]
+    };
+    state.tiles[0][1] = { kind: 'elbow', orientation: 0, originalOrientation: 0 };
+
+    const after = discardAllOffers(state);
+
+    expect(after.ghostPipes).toHaveLength(0);
+    expect(after.ghostRecoveryRequired).toBe(true);
+    expect(after.logs.some((entry) => entry.event === 'ghost.recovery.required')).toBe(true);
+  });
+
+  it('clearAllPipesForGhostRecovery clears all pipes and applies penalties', () => {
+    const base = initGame({
+      gridWidth: 3,
+      gridHeight: 1,
+      endpointScenario: [{ size: 2, groups: 1 }],
+      energy: 25,
+      boosters: 3,
+      offerSeed: 470,
+      rng: () => 0.2
+    });
+
+    const blocked: GameState = {
+      ...base,
+      score: 80,
+      tiles: createEmptyTiles(1, 3),
+      endpointNodes: [
+        { id: 'g1-a', row: 0, col: 0, groupId: 'g1', colorId: 0 },
+        { id: 'g1-b', row: 0, col: 2, groupId: 'g1', colorId: 0 }
+      ],
+      endpointGroups: [{ id: 'g1', colorId: 0, nodeIds: ['g1-a', 'g1-b'] }],
+      offers: [makeOffer('straight', 90)],
+      ghostRecoveryRequired: true
+    };
+    blocked.tiles[0][1] = { kind: 'elbow', orientation: 0, originalOrientation: 0 };
+
+    const cleared = clearAllPipesForGhostRecovery(blocked);
+    expect(cleared.tiles.flat().every((tile) => tile === null)).toBe(true);
+    expect(cleared.energy).toBe(5);
+    expect(cleared.score).toBe(0);
+    expect(cleared.ghostRecoveryRequired).toBe(false);
+    expect(cleared.logs.some((entry) => entry.event === 'ghost.recovery.clear')).toBe(true);
   });
 
   it('offer kind respects spawn toggles', () => {

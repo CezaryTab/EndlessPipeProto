@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   addGridHeight,
   addGridWidth,
+  clearAllPipesForGhostRecovery,
   ENDPOINT_COLOR_PALETTE,
   DEFAULT_BOOSTERS,
   DEFAULT_DIFFICULTY_TIERS,
@@ -15,6 +16,7 @@ import {
   initGame,
   placeOffer,
   rotateAllOffers,
+  dismissGhostRecovery,
   setDifficultyTiers,
   setEndpointScenario,
   resetScore,
@@ -33,8 +35,11 @@ import {
 import { renderFrame, type DragRenderState, type GridRenderMetrics } from './Renderer';
 import {
   ALL_DIRECTIONS,
+  areEdgesConnected,
   directionToDelta,
   getPipeTopology,
+  oppositeDirection,
+  type DirectionBit,
   type Orientation,
   type PipeKind
 } from './Pipe';
@@ -100,6 +105,31 @@ interface EndpointTransitionPiece {
   mode: 'exit' | 'enter';
 }
 
+interface CompletionFlowPipePiece {
+  id: number;
+  x: number;
+  y: number;
+  size: number;
+  color: string;
+  delayMs: number;
+  mode: 'pipe';
+  kind: PipeKind;
+  orientation: Orientation;
+}
+
+interface CompletionFlowEndpointPiece {
+  id: number;
+  endpointId: string;
+  x: number;
+  y: number;
+  size: number;
+  color: string;
+  delayMs: number;
+  mode: 'endpoint';
+}
+
+type CompletionFlowPiece = CompletionFlowPipePiece | CompletionFlowEndpointPiece;
+
 function createInitialDragState(): DragState {
   return {
     active: false,
@@ -149,6 +179,9 @@ function seededRatio(seed: number): number {
 const PIPE_KIND_ORDER: PipeKind[] = ['straight', 'elbow', 'tee', 'cross'];
 const DIFFICULTY_TIERS_STORAGE_KEY = 'endless-pipe.difficultyTiers.v1';
 const GRID_EXPAND_ENDPOINT_RESPAWN_DELAY_MS = 280;
+const COMPLETION_FLOW_STEP_MS = 66;
+const COMPLETION_FLOW_PULSE_MS = 420;
+const COMPLETION_FLOW_MIN_HOLD_MS = 280;
 const PIPE_KIND_LABEL: Record<PipeKind, string> = {
   straight: 'Straight',
   elbow: 'Elbow',
@@ -156,6 +189,182 @@ const PIPE_KIND_LABEL: Record<PipeKind, string> = {
   tee: 'T',
   cross: 'Cross'
 };
+
+function toCellKey(row: number, col: number): string {
+  return `${row},${col}`;
+}
+
+function brightenColor(color: string, amount: number): string {
+  const clampedAmount = clamp(amount, 0, 1);
+  const raw = color.trim();
+  const compact = raw.startsWith('#') ? raw.slice(1) : '';
+  if (compact.length !== 3 && compact.length !== 6) {
+    return color;
+  }
+
+  const normalized = compact.length === 3
+    ? compact.split('').map((char) => `${char}${char}`).join('')
+    : compact;
+  const red = Number.parseInt(normalized.slice(0, 2), 16);
+  const green = Number.parseInt(normalized.slice(2, 4), 16);
+  const blue = Number.parseInt(normalized.slice(4, 6), 16);
+
+  if ([red, green, blue].some((channel) => Number.isNaN(channel))) {
+    return color;
+  }
+
+  const mixChannel = (channel: number): number =>
+    Math.round(channel + (255 - channel) * clampedAmount);
+
+  return `rgb(${mixChannel(red)} ${mixChannel(green)} ${mixChannel(blue)})`;
+}
+
+function buildCompletionFlowPieces(params: {
+  completedEndpoints: CompletedEndpointBurstLog[];
+  completedPipes: CompletedPipeBurstLog[];
+  metrics: GridRenderMetrics;
+  nextAnimationId: () => number;
+}): CompletionFlowPiece[] {
+  const { completedEndpoints, completedPipes, metrics, nextAnimationId } = params;
+  const pieces: CompletionFlowPiece[] = [];
+  if (completedEndpoints.length === 0 || completedPipes.length === 0) {
+    return pieces;
+  }
+
+  const pipeByKey = new Map<string, CompletedPipeBurstLog>();
+  const topologyByKey = new Map<string, ReturnType<typeof getPipeTopology>>();
+  for (const pipe of completedPipes) {
+    const key = toCellKey(pipe.row, pipe.col);
+    pipeByKey.set(key, pipe);
+    topologyByKey.set(key, getPipeTopology(pipe.kind, pipe.orientation));
+  }
+
+  for (let endpointIndex = 0; endpointIndex < completedEndpoints.length; endpointIndex += 1) {
+    const endpoint = completedEndpoints[endpointIndex]!;
+    const baseColor = ENDPOINT_COLOR_PALETTE[endpoint.colorId % ENDPOINT_COLOR_PALETTE.length] ?? '#ffffff';
+    const flowColor = brightenColor(baseColor, 0.46);
+    const endpointDelayMs = endpointIndex * 14;
+
+    pieces.push({
+      id: nextAnimationId(),
+      endpointId: endpoint.id,
+      x: metrics.originX + (endpoint.col + 0.5) * metrics.cellSize,
+      y: metrics.originY + (endpoint.row + 0.5) * metrics.cellSize,
+      size: Math.max(12, metrics.cellSize * 0.34),
+      color: flowColor,
+      delayMs: endpointDelayMs,
+      mode: 'endpoint'
+    });
+
+    interface TraversalState {
+      row: number;
+      col: number;
+      incoming: DirectionBit;
+      distance: number;
+    }
+
+    const queue: TraversalState[] = [];
+    const bestStateDistance = new Map<string, number>();
+    const bestPipeDelay = new Map<string, number>();
+
+    for (const direction of ALL_DIRECTIONS) {
+      const delta = directionToDelta(direction);
+      const nextRow = endpoint.row + delta.dr;
+      const nextCol = endpoint.col + delta.dc;
+      const nextKey = toCellKey(nextRow, nextCol);
+      const nextPipe = pipeByKey.get(nextKey);
+      const nextTopology = topologyByKey.get(nextKey);
+      if (!nextPipe || !nextTopology) {
+        continue;
+      }
+
+      const incoming = oppositeDirection(direction);
+      if ((nextTopology.mask & incoming) === 0) {
+        continue;
+      }
+
+      const stateKey = `${nextKey}|${incoming}`;
+      bestStateDistance.set(stateKey, 1);
+      queue.push({
+        row: nextRow,
+        col: nextCol,
+        incoming,
+        distance: 1
+      });
+    }
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      const currentKey = toCellKey(current.row, current.col);
+      const currentPipe = pipeByKey.get(currentKey);
+      if (!currentPipe) {
+        continue;
+      }
+
+      const arrivalDelay = endpointDelayMs + (current.distance - 1) * COMPLETION_FLOW_STEP_MS;
+      const previousDelay = bestPipeDelay.get(currentKey);
+      if (previousDelay === undefined || arrivalDelay < previousDelay) {
+        bestPipeDelay.set(currentKey, arrivalDelay);
+      }
+
+      for (const direction of ALL_DIRECTIONS) {
+        if (!areEdgesConnected(currentPipe.kind, currentPipe.orientation, current.incoming, direction)) {
+          continue;
+        }
+
+        const delta = directionToDelta(direction);
+        const nextRow = current.row + delta.dr;
+        const nextCol = current.col + delta.dc;
+        const nextKey = toCellKey(nextRow, nextCol);
+        const nextPipe = pipeByKey.get(nextKey);
+        const nextTopology = topologyByKey.get(nextKey);
+        if (!nextPipe || !nextTopology) {
+          continue;
+        }
+
+        const nextIncoming = oppositeDirection(direction);
+        if ((nextTopology.mask & nextIncoming) === 0) {
+          continue;
+        }
+
+        const nextDistance = current.distance + 1;
+        const stateKey = `${nextKey}|${nextIncoming}`;
+        const previousDistance = bestStateDistance.get(stateKey);
+        if (previousDistance !== undefined && previousDistance <= nextDistance) {
+          continue;
+        }
+
+        bestStateDistance.set(stateKey, nextDistance);
+        queue.push({
+          row: nextRow,
+          col: nextCol,
+          incoming: nextIncoming,
+          distance: nextDistance
+        });
+      }
+    }
+
+    for (const [pipeKey, delayMs] of bestPipeDelay.entries()) {
+      const pipe = pipeByKey.get(pipeKey);
+      if (!pipe) {
+        continue;
+      }
+      pieces.push({
+        id: nextAnimationId(),
+        x: metrics.originX + (pipe.col + 0.5) * metrics.cellSize,
+        y: metrics.originY + (pipe.row + 0.5) * metrics.cellSize,
+        size: Math.max(18, metrics.cellSize * 0.92),
+        color: flowColor,
+        delayMs,
+        mode: 'pipe',
+        kind: pipe.kind,
+        orientation: pipe.orientation
+      });
+    }
+  }
+
+  return pieces;
+}
 function cloneDifficultyTiers(tiers: DifficultyTier[]): DifficultyTier[] {
   return tiers.map((tier) => ({
     ...tier,
@@ -555,6 +764,7 @@ export default function App(): JSX.Element {
   const [canvasSize, setCanvasSize] = useState({ width: 640, height: 640 });
   const [groupSizesInput, setGroupSizesInput] = useState<number[]>(() => scenarioToGroupSizes(game.endpointScenario));
   const [confettiPieces, setConfettiPieces] = useState<ConfettiPiece[]>([]);
+  const [completionFlowPieces, setCompletionFlowPieces] = useState<CompletionFlowPiece[]>([]);
   const [pipeExitPieces, setPipeExitPieces] = useState<PipeExitPiece[]>([]);
   const [endpointTransitionPieces, setEndpointTransitionPieces] = useState<EndpointTransitionPiece[]>([]);
   const [hiddenEndpointIds, setHiddenEndpointIds] = useState<Set<string>>(() => new Set());
@@ -574,6 +784,7 @@ export default function App(): JSX.Element {
   const animationIdRef = useRef<number>(0);
   const processedLogIdRef = useRef<number>(0);
   const expandRespawnTimerRef = useRef<number | null>(null);
+  const completionStageTimersRef = useRef<number[]>([]);
 
   const activeOffer = useMemo(() => {
     if (drag.offerIndex === null) {
@@ -800,9 +1011,11 @@ export default function App(): JSX.Element {
     }
 
     const nextConfettiPieces: ConfettiPiece[] = [];
+    const nextFlowPieces: CompletionFlowPiece[] = [];
     const nextPipeExitPieces: PipeExitPiece[] = [];
     const nextEndpointPieces: EndpointTransitionPiece[] = [];
     const nextHiddenEndpointIds = new Set<string>();
+    let maxFlowDelayMs = 0;
 
     const nextAnimationId = (): number => {
       const id = animationIdRef.current;
@@ -824,6 +1037,19 @@ export default function App(): JSX.Element {
       const groupSet = new Set(groupIds);
 
       const respawnedEndpoints = game.endpointNodes.filter((endpoint) => groupSet.has(endpoint.groupId));
+      const flowPieces = buildCompletionFlowPieces({
+        completedEndpoints,
+        completedPipes,
+        metrics,
+        nextAnimationId
+      });
+
+      for (const flowPiece of flowPieces) {
+        nextFlowPieces.push(flowPiece);
+        if (flowPiece.delayMs > maxFlowDelayMs) {
+          maxFlowDelayMs = flowPiece.delayMs;
+        }
+      }
 
       for (const pipe of completedPipes) {
         nextPipeExitPieces.push({
@@ -896,15 +1122,6 @@ export default function App(): JSX.Element {
       }
     }
 
-    if (nextConfettiPieces.length > 0) {
-      setConfettiPieces((current) => [...current, ...nextConfettiPieces]);
-    }
-    if (nextPipeExitPieces.length > 0) {
-      setPipeExitPieces((current) => [...current, ...nextPipeExitPieces]);
-    }
-    if (nextEndpointPieces.length > 0) {
-      setEndpointTransitionPieces((current) => [...current, ...nextEndpointPieces]);
-    }
     if (nextHiddenEndpointIds.size > 0) {
       setHiddenEndpointIds((current) => {
         const next = new Set(current);
@@ -914,6 +1131,36 @@ export default function App(): JSX.Element {
         return next;
       });
     }
+    if (nextFlowPieces.length > 0) {
+      setCompletionFlowPieces((current) => [...current, ...nextFlowPieces]);
+    }
+
+    const flushCompletionEffects = () => {
+      if (nextConfettiPieces.length > 0) {
+        setConfettiPieces((current) => [...current, ...nextConfettiPieces]);
+      }
+      if (nextPipeExitPieces.length > 0) {
+        setPipeExitPieces((current) => [...current, ...nextPipeExitPieces]);
+      }
+      if (nextEndpointPieces.length > 0) {
+        setEndpointTransitionPieces((current) => [...current, ...nextEndpointPieces]);
+      }
+    };
+
+    if (nextFlowPieces.length === 0) {
+      flushCompletionEffects();
+      return;
+    }
+
+    const holdMs = Math.max(
+      COMPLETION_FLOW_MIN_HOLD_MS,
+      maxFlowDelayMs + COMPLETION_FLOW_PULSE_MS
+    );
+    const timer = window.setTimeout(() => {
+      flushCompletionEffects();
+      completionStageTimersRef.current = completionStageTimersRef.current.filter((id) => id !== timer);
+    }, holdMs);
+    completionStageTimersRef.current.push(timer);
   }, [game.logs, game.endpointNodes]);
 
   const startDragFromOffer = (offerIndex: number, event: React.PointerEvent<HTMLDivElement>) => {
@@ -946,9 +1193,14 @@ export default function App(): JSX.Element {
       window.clearTimeout(expandRespawnTimerRef.current);
       expandRespawnTimerRef.current = null;
     }
+    for (const timer of completionStageTimersRef.current) {
+      window.clearTimeout(timer);
+    }
+    completionStageTimersRef.current = [];
     setDrag(createInitialDragState());
     dragOfferRef.current = null;
     setConfettiPieces([]);
+    setCompletionFlowPieces([]);
     setPipeExitPieces([]);
     setEndpointTransitionPieces([]);
     setHiddenEndpointIds(new Set());
@@ -961,6 +1213,10 @@ export default function App(): JSX.Element {
         window.clearTimeout(expandRespawnTimerRef.current);
         expandRespawnTimerRef.current = null;
       }
+      for (const timer of completionStageTimersRef.current) {
+        window.clearTimeout(timer);
+      }
+      completionStageTimersRef.current = [];
     };
   }, []);
 
@@ -1245,6 +1501,15 @@ export default function App(): JSX.Element {
     setGame((state) => resetScore(state));
   };
 
+  const handleGhostRecoveryDismiss = () => {
+    setGame((state) => dismissGhostRecovery(state));
+  };
+
+  const handleGhostRecoveryClear = () => {
+    clearTransientInteraction();
+    setGame((state) => clearAllPipesForGhostRecovery(state));
+  };
+
   const handleResetBoard = () => {
     clearTransientInteraction();
     setGame((state) =>
@@ -1316,6 +1581,61 @@ export default function App(): JSX.Element {
             <main className="canvas-wrap" ref={canvasWrapRef}>
               <canvas ref={canvasRef} className="game-canvas" />
               <div className="completion-layer" aria-hidden="true">
+                {completionFlowPieces.map((piece) => {
+                  if (piece.mode === 'pipe') {
+                    return (
+                      <span
+                        key={piece.id}
+                        className="completion-flow completion-flow-pipe"
+                        style={
+                          {
+                            left: piece.x,
+                            top: piece.y,
+                            width: piece.size,
+                            height: piece.size,
+                            '--flow-delay': `${piece.delayMs}ms`,
+                            '--flow-color': piece.color
+                          } as React.CSSProperties
+                        }
+                        onAnimationEnd={() => {
+                          setCompletionFlowPieces((current) =>
+                            current.filter((currentPiece) => currentPiece.id !== piece.id)
+                          );
+                        }}
+                      >
+                        <PipeGlyph
+                          kind={piece.kind}
+                          orientation={piece.orientation}
+                          color={piece.color}
+                          className="completion-flow-glyph"
+                        />
+                      </span>
+                    );
+                  }
+
+                  return (
+                    <span
+                      key={piece.id}
+                      className="completion-flow completion-flow-endpoint"
+                      style={
+                        {
+                          left: piece.x,
+                          top: piece.y,
+                          width: piece.size,
+                          height: piece.size,
+                          backgroundColor: piece.color,
+                          '--flow-delay': `${piece.delayMs}ms`,
+                          '--flow-color': piece.color
+                        } as React.CSSProperties
+                      }
+                      onAnimationEnd={() => {
+                        setCompletionFlowPieces((current) =>
+                          current.filter((currentPiece) => currentPiece.id !== piece.id)
+                        );
+                      }}
+                    />
+                  );
+                })}
                 {pipeExitPieces.map((piece) => (
                   <span
                     key={piece.id}
@@ -1402,6 +1722,25 @@ export default function App(): JSX.Element {
                   />
                 ))}
               </div>
+              {game.ghostRecoveryRequired && (
+                <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="ghost-recovery-title">
+                  <div className="modal-card">
+                    <h2 id="ghost-recovery-title">No Ghost Solution</h2>
+                    <p>
+                      No solvable ghost path was found for the current board.
+                      You can clear all placed pipes to recover.
+                    </p>
+                    <div className="modal-actions">
+                      <button type="button" onClick={handleGhostRecoveryDismiss}>
+                        Keep Playing
+                      </button>
+                      <button type="button" className="danger" onClick={handleGhostRecoveryClear}>
+                        Clear All (-20 Energy, -100 Score)
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
             </main>
 
             <footer className="offers-panel">
